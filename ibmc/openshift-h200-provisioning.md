@@ -680,12 +680,15 @@ EOF
 echo "Waiting for GPU operator..."; until oc get csv -n nvidia-gpu-operator 2>/dev/null | grep gpu-operator | grep -q Succeeded; do sleep 10; done
 
 # minimal ClusterPolicy (no RDMA — we're not using RoCE)
+# Note: v25.x+ requires daemonsets and nodeStatusExporter fields
 oc apply -f - <<EOF
 apiVersion: nvidia.com/v1
 kind: ClusterPolicy
 metadata: {name: gpu-cluster-policy}
 spec:
   operator: {defaultRuntime: crio, use_ocp_driver_toolkit: true}
+  daemonsets: {}
+  nodeStatusExporter: {enabled: true}
   driver: {enabled: true}
   toolkit: {enabled: true}
   devicePlugin: {enabled: true}
@@ -713,9 +716,12 @@ oc exec -n nvidia-gpu-operator $POD -c nvidia-driver-ctr -- nvidia-smi --query-g
 # expect: 8x  "NVIDIA H100 80GB, 81920 MiB"
 
 # smoke test: run a CUDA workload on a GPU
-oc run cuda-smoke --rm -it --restart=Never --image=nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0 \
+oc run cuda-smoke --restart=Never --image=nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0 \
   --overrides='{"spec":{"containers":[{"name":"cuda-smoke","image":"nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0","resources":{"limits":{"nvidia.com/gpu":"1"}}}]}}'
-# expect: "Test PASSED"
+oc wait pod/cuda-smoke --for=condition=Ready --timeout=60s 2>/dev/null || true
+sleep 10
+oc logs cuda-smoke    # expect: "Test PASSED"
+oc delete pod cuda-smoke
 ```
 
 ✅ **Done — 3 masters + 1 H100 node, 8 GPUs schedulable.**
@@ -726,9 +732,17 @@ oc run cuda-smoke --rm -it --restart=Never --image=nvcr.io/nvidia/k8s/cuda-sampl
 
 ```bash
 source ~/.ibmcloud-h200-env; ibmcloud_login
+export KUBECONFIG="$INSTALL_DIR/auth/kubeconfig"
+ibmcloud cis instance-set $CIS_INSTANCE
+export CIS_DOMAIN_ID=$(ibmcloud cis domains --output json | jq -r --arg d "$BASE_DOMAIN" '.[] | select(.name==$d) | .id')
 
 # 1) GPU node first (the expensive part)
 ibmcloud is instance-delete $H200_0_ID --force 2>/dev/null
+
+# 1b) clean up any remaining COS HMAC service keys (hmac/hmac2 are removed in B10; hmac3+ if presigned URL was regenerated)
+for KEY in $(ibmcloud resource service-keys --output json 2>/dev/null | jq -r '.[] | select(.name | startswith("ocp-h200-hmac")) | .name'); do
+  ibmcloud resource service-key-delete "$KEY" --force 2>/dev/null || true
+done
 
 # 2) delete ALL load balancers (the cloud controller made an extra ingress LB), then wait for their reserved IPs to clear
 for LB in $(ibmcloud is load-balancers --output json | jq -r '.[].id'); do ibmcloud is load-balancer-delete $LB --force; done
@@ -738,11 +752,15 @@ until [ "$(ibmcloud is subnet-reserved-ips $MGMT_SUBNET_ID --output json | jq '[
 ibmcloud is instance-delete ocp-h200-master-0 ocp-h200-master-1 ocp-h200-master-2 --force; sleep 60
 ibmcloud is image-delete ocp-h200-rhcos --force 2>/dev/null
 ibmcloud is security-group-delete $SG_NAME --force 2>/dev/null
-ibmcloud cis instance-set $CIS_INSTANCE
 for r in $(ibmcloud cis dns-records $CIS_DOMAIN_ID --output json | jq -r --arg c "$CLUSTER_NAME" '.[]|select(.name|contains($c))|.id'); do echo y | ibmcloud cis dns-record-delete $CIS_DOMAIN_ID $r; done
 export COS_CRN=$(ibmcloud resource service-instance $COS_INSTANCE --output json | jq -r '.[0].crn')
 ibmcloud cos bucket-delete --bucket "$COS_IGN_BUCKET" --region "$IBMCLOUD_REGION" --force 2>/dev/null
 ibmcloud cos bucket-delete --bucket "$COS_IMAGE_BUCKET" --region "$IBMCLOUD_REGION" --force 2>/dev/null
+# Remove the VPC image → COS Reader IAM authorization policy created in B5
+for POL in $(ibmcloud iam authorization-policies --output json 2>/dev/null | \
+  jq -r '.[] | select(.subjects[].attributes[] | select(.name=="resourceType" and .value=="image")) | .id'); do
+  ibmcloud iam authorization-policy-delete "$POL" --force 2>/dev/null || true
+done
 
 # 4) subnet → PGW → address prefix → VPC
 echo y | ibmcloud is subnet-public-gateway-detach $MGMT_SUBNET_ID
@@ -754,26 +772,11 @@ ibmcloud is vpc-delete $VPC_ID --force
 rm -rf "$INSTALL_DIR"
 ```
 
-> **Stopped ≠ free.** Stopping an H200 instance (`ibmcloud is instance-stop <id> --force`) keeps it
+> **Stopped ≠ free.** Stopping an H100 instance (`ibmcloud is instance-stop <id> --force`) keeps it
 > billing and counting against quota. To actually stop paying, **delete** it.
 
----
-
-## Gotchas (all seen in the prior PoC)
-
-| Symptom | Cause / fix |
-|---|---|
-| RHCOS boots with no config / nothing installs (IPI) | IBM Cloud IPI is broken (`metadata_service=false`, `user_data=null`). Use **UPI** (this guide). |
-| `i/o timeout` reaching `api`/`api-int` | The auto-created **LB security group** blocks 6443/22623. Add the rules (Part B6). |
-| `openshift-install` fails with `no such host` | macOS cached an NXDOMAIN. Run the **DNS-flush loop** (Part B10) while it runs. |
-| Pods on a GPU node can't resolve/egress | Restart `ovnkube-node` on that node (Part C). |
-| `instance-create` fails / `cannot_start_capacity` | Quota not raised, or no free H200/H100 in that zone. First retry H200; if still failing, switch to H100 (`gx3d-160x1792x8h100` — same specs, wider availability). See Part C for the fallback commands. |
-| `ibmcloud login` → "Provided API key could not be found" (`BXNIM0415E`) | A stale `IBMCLOUD_API_KEY` is set in your shell (often from `~/.zshrc` sourcing an old env file). `unset IBMCLOUD_API_KEY IC_API_KEY`, log in with `--sso`, mint a fresh key (Part A2–A3). |
-| `--keys` seems ignored on the H200/H100 | Expected on GPU instances — SSH key comes from `worker.ign`. You don't need SSH here. |
-| GPU node takes 60–90 min to show CSRs | H100/H200 HGX hosts have long hardware init (NVLink fabric). The node is booting — ignition runs ~9 min after creation, then 2–3 reboots for MCD. Keep running the CSR approve loop. Check the serial console in the IBM Cloud web UI if stuck. |
-| `nvidia-smi: command not found` via `oc debug` | Run it in the **driver container** (`-c nvidia-driver-ctr`), as in Part E. |
-| GPU Operator channel rejected / driver too old for H200 | Pick the current `gpu-operator-certified` channel in OperatorHub; H200 needs driver ≥ 570 / CUDA 12.8. |
-| Teardown: subnet won't delete | Delete **all** LBs first and wait for their reserved IPs to clear (Part F). |
+> **In-cluster operators** (cert-manager, NFD, GPU Operator) disappear automatically when the
+> masters are deleted — no separate cloud teardown needed for them.
 
 ---
 
