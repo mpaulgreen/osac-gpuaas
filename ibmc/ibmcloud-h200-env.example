@@ -1,0 +1,61 @@
+#!/bin/bash
+################################################################################
+# IBM Cloud — OpenShift + 2× H200 deployment environment
+# Copy to ~/.ibmcloud-h200-env, fill in the values, then: source ~/.ibmcloud-h200-env
+# chmod 600 ~/.ibmcloud-h200-env   (contains your API key — keep it private, never commit)
+################################################################################
+
+# --- IBM Cloud account ---
+export IBMCLOUD_API_KEY="<paste-your-api-key-here>"  # Created from within the target account; determines which account the CLI lands on
+export IBMCLOUD_REGION="ca-tor"                  # H200 region (ca-tor, us-east, eu-de, eu-gb, au-syd, chennai)
+export IBMCLOUD_ZONE="ca-tor-3"                   # Zone in ca-tor with H200/H100 capacity
+export IBMCLOUD_RESOURCE_GROUP="Default"
+
+# The OpenShift installer reads IC_API_KEY (not IBMCLOUD_API_KEY)
+export IC_API_KEY="$IBMCLOUD_API_KEY"
+
+# --- Cluster identity ---
+export CLUSTER_NAME="ocp-h200"
+export BASE_DOMAIN="ibmc.kni.syseng.devcluster.openshift.com"   # Domain managed in your CIS instance (ocp-cis)
+
+# --- GPU worker profile (sole-tenant 8-GPU HGX host) ---
+# H200 is preferred; if zone capacity is exhausted, fall back to H100 (same family, same specs).
+# Both profiles: 160 vCPU, 1792 GB RAM, 8 GPUs, 200 Gbps bandwidth.
+export H200_GPU_PROFILE="gx3d-160x1792x8h200"
+# export H200_GPU_PROFILE="gx3d-160x1792x8h100"   # fallback if H200 is out of capacity
+
+# --- Pre-existing account resources (discovered 2026-09-03) ---
+export CIS_INSTANCE="ocp-cis"                     # ✅ IBM Cloud Internet Services instance (DNS for BASE_DOMAIN)
+export COS_INSTANCE="ocp-cos"                     # Check first: ibmcloud resource service-instances --service-name cloud-object-storage
+export SSH_KEY_ID="<your-ssh-key-id>"  # Run: ibmcloud is key-create my-ocp-key-ca-tor @~/.ssh/id_rsa.pub → copy the returned ID
+
+# --- Names this guide creates (leave as-is unless you want different names) ---
+export VPC_NAME="ocp-h200-vpc"
+export SUBNET_NAME="ocp-h200-subnet"
+export SG_NAME="ocp-h200-sg"
+export SUBNET_CIDR="10.240.0.0/24"
+
+# --- Filled in as you go (the guide saves IDs here with sed) ---
+export VPC_ID=""
+export MGMT_SUBNET_ID=""
+export OCP_SG_ID=""
+export IMAGE_ID=""
+export COS_IGN_BUCKET=""
+export COS_IMAGE_BUCKET=""
+export H200_0_ID=""
+export H200_1_ID=""
+export H200_0_NODE=""
+export H200_1_NODE=""
+
+# --- Derived paths ---
+export INSTALL_DIR="$HOME/ocp-h200-install"
+export KUBECONFIG="$INSTALL_DIR/auth/kubeconfig"
+export PULL_SECRET_PATH="$HOME/.pull-secret.json"
+export SSH_KEY_PATH="$HOME/.ssh/id_rsa.pub"
+
+ibmcloud_login() {
+  ibmcloud login --apikey "$IBMCLOUD_API_KEY" -r "$IBMCLOUD_REGION" -g "$IBMCLOUD_RESOURCE_GROUP"
+}
+
+echo "IBM Cloud H200 environment loaded (cluster: $CLUSTER_NAME, region: $IBMCLOUD_REGION)"
+echo "Run 'ibmcloud_login' to authenticate."

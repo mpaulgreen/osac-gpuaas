@@ -1,0 +1,19 @@
+# IBM Cloud credentials and env files — NEVER commit these
+.ibmcloud-h200-env
+*.env
+!*.env.example
+!*-env.example
+
+# OpenShift install directory (contains kubeconfig, kubeadmin password, ignition configs)
+ocp-h200-install/
+*-install/
+
+# Pull secret
+.pull-secret.json
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
