@@ -791,6 +791,88 @@ oc get node ocp-h200-0 -o jsonpath='{.status.allocatable}' | jq . | grep nvidia
 
 ---
 
+## TODO — OCP 4.22
+
+The following validations could not be completed on OCP 4.21 because `DRAPartitionableDevices`
+is not in OCP 4.21's `TechPreviewNoUpgrade` catalog (it was added in OCP 4.22). Additionally,
+both `TechPreviewNoUpgrade` and `CustomNoUpgrade` are permanently irreversible once set on OCP 4.21,
+preventing switching between them.
+
+### Enable on OCP 4.22
+
+On OCP 4.22, `DRAPartitionableDevices` is included in `TechPreviewNoUpgrade`:
+
+```bash
+oc patch featuregate cluster --type=merge -p '{"spec":{"featureSet":"TechPreviewNoUpgrade"}}'
+# Triggers rolling restart of kube-apiserver and kube-scheduler (~5 min)
+# Note: TechPreviewNoUpgrade is still permanently irreversible (blocks minor version upgrades)
+```
+
+Verify DRA driver no longer logs "fields dropped: DRAPartitionableDevices":
+```bash
+oc logs -n nvidia-gpu-operator -l app=nvidia-dra-driver-kubelet-plugin --tail=10 | grep -i "dropped\|DRAPartition"
+# Expected: no matches
+```
+
+### 1. DynamicMIG — On-Demand MIG Partitioning
+
+Enable in GPUCluster and submit a `mig.nvidia.com` ResourceClaim:
+```bash
+oc patch gpucluster gpu-cluster --type=merge -p '{"spec":{"draDriver":{"featureGates":{"DynamicMIG":true},"gpus":{}}}}'
+
+cat <<'EOF' | oc apply -f -
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: mig-dynamic-1g10gb
+  namespace: poc4-dra
+spec:
+  devices:
+    requests:
+      - name: mig-slice
+        exactly:
+          deviceClassName: mig.nvidia.com
+          selectors:
+            - cel:
+                expression: 'device.attributes["profile"].string == "1g.10gb"'
+          count: 1
+EOF
+```
+
+Observe: DRA driver creates the MIG partition on-demand, `mig.nvidia.com` ResourceSlice appears,
+pod schedules and gets isolated slice. No pre-configured MIG geometry needed.
+
+### 2. Two-Pod Simultaneous MIG Isolation
+
+Submit one `1g.10gb` and one `2g.20gb` claim simultaneously. Expected:
+- Different GI IDs (hardware isolation confirmed)
+- Pod A sees ~9.5 GB, Pod B sees ~19.5 GB
+- Both run without any node label changes
+
+### 3. DynamicMIG Teardown
+
+After pods complete, verify MIG instance is destroyed:
+```bash
+oc exec -n nvidia-gpu-operator <driver-pod> -c nvidia-driver-ctr -- nvidia-smi mig -lgi
+# Expected: No MIG instances (released by DRA driver after claim deletion)
+```
+
+### 4. Static MIG + DRA (without manual nvidia-smi)
+
+On OCP 4.22, with `DRAPartitionableDevices` enabled, pre-configured MIG instances appear automatically
+as `mig.nvidia.com` ResourceSlices when MIG geometry is set via node labels (no manual nvidia-smi
+commands needed). Validate the full CEL-based selection path.
+
+### 5. OCP Version Roadmap
+
+| OCP | K8s | `DRAPartitionableDevices` | How to Enable |
+|---|---|---|---|
+| 4.21 | 1.34 | Not in TechPreview | `CustomNoUpgrade` only — but locked out if TechPreviewNoUpgrade already set |
+| **4.22** | **1.35** | **In TechPreviewNoUpgrade** | `oc patch featuregate cluster --type=merge -p '{"spec":{"featureSet":"TechPreviewNoUpgrade"}}'` |
+| 5.0+ | 1.36+ | Default-on | No gate needed |
+
+---
+
 ## References
 
 - [DRA GA in Kubernetes 1.34](https://kubernetes.io/blog/2025/09/01/kubernetes-v1-34-dra-updates/)
