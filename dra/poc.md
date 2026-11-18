@@ -1,6 +1,6 @@
 # DRA for GPUs on OpenShift — Research Notes
 
-> **TL;DR:** DRA provides attribute-based GPU scheduling; MIG provides hardware isolation. Together they enable fine-grained multi-tenant GPU allocation without node-level label management. DRA is GA in OCP 4.21. Enabling it on our cluster requires upgrading the GPU Operator to v26.3 and migrating from `ClusterPolicy` to the new `GPUCluster` CRD — a one-way migration.
+> **TL;DR:** DRA provides attribute-based GPU scheduling; MIG provides hardware isolation. Together they enable fine-grained multi-tenant GPU allocation without node-level label management. DRA is GA in OCP 4.21. Enabling it on our cluster requires upgrading the GPU Operator to **v26.7** and migrating from `ClusterPolicy` to the new `GPUCluster` CRD — a one-way migration.
 
 **GPUaaS connection**: DRA is the discovery and selection layer beneath the entitlement controller. ResourceSlices replace manual GPU counting. DeviceClasses map to SKU tiers. ResourceClaims are what workloads submit. MIG + DRA together replace the global node-label management that makes MIG operationally painful at scale.
 
@@ -9,8 +9,8 @@
 ## Prerequisites
 
 - **OCP 4.21.42** (K8s 1.34) — DRA GA, `resource.k8s.io/v1`, `DynamicResourceAllocation` on by default
-- **GPU Operator v26.3** — required for DRA driver via `GPUCluster` CRD (currently v25.10.1 on cluster, upgrade needed)
-- **Red Hat operator coverage**: DRA framework in OCP core (Red Hat). NVIDIA DRA driver embedded in `gpu-operator-certified` v26.3 (certified-operators catalog)
+- **GPU Operator v26.7** — required for DRA driver via `GPUCluster` CRD (validated on v26.7.2)
+- **Red Hat operator coverage**: DRA framework in OCP core (Red Hat). NVIDIA DRA driver embedded in `gpu-operator-certified` v26.7 (certified-operators catalog)
 - `ClusterPolicy` and `GPUCluster` are **mutually exclusive** — switching to DRA removes the device plugin (`nvidia.com/gpu` resource disappears)
 - **Known K8s 1.34 DRA bug**: 1.34.0 and 1.34.1 have a scheduler bug affecting DRA. Verify OCP patch level is 4.21.3+ (uses 1.34.2+) before enabling
 
@@ -22,11 +22,11 @@
   ┌─────────────────────────────────────────────────────────────┐
   │                 DRA Data Flow (OCP 4.21+)                    │
   │                                                             │
-  │  GPU Operator v26.3                                          │
+  │  GPU Operator v26.7                                          │
   │  ┌──────────────────┐    publishes    ┌───────────────────┐  │
   │  │  NVIDIA DRA       │───────────────▶│   ResourceSlice    │  │
-  │  │  kubelet plugin   │                │   (per node,       │  │
-  │  │  (gpu.nvidia.com) │                │    per GPU chip)   │  │
+  │  │  kubelet plugin   │                │   (per node —      │  │
+  │  │  (gpu.nvidia.com) │                │  all GPUs in one)  │  │
   │  └──────────────────┘                │                   │  │
   │                                       │  devices:         │  │
   │  DeviceClasses (admin-defined)         │  - uuid: ...      │  │
@@ -50,7 +50,7 @@
   │  └──────────────────┘                                         │
   └─────────────────────────────────────────────────────────────┘
 
-  DeviceClass objects created by GPU Operator v26.3:
+  DeviceClass objects created by GPU Operator v26.7:
     gpu.nvidia.com          — whole H100 chips
     mig.nvidia.com          — MIG slice instances (profile + parentUUID)
     compute-domain-daemon.nvidia.com    — multi-node NVLink (GB200+)
@@ -161,7 +161,7 @@ oc get resourceslices
 oc get resourceslices -o json | jq '
   .items[] | select(.spec.driver=="mig.nvidia.com") | {
     node: .spec.nodeName,
-    devices: [.spec.devices[] | {name: .name, profile: .basic.attributes["gpu.nvidia.com"].profile}]
+    devices: [.spec.devices[] | {name: .name, profile: .attributes["profile"].string}]
   }'
 # Expected: entries with profile="1g.10gb", "2g.20gb", "3g.40gb"
 ```
@@ -251,6 +251,12 @@ oc get resourceslice ${RS} -o json | jq '{
 Admin-defined `DeviceClass` objects use CEL expressions evaluated by the scheduler against `ResourceSlice` device attributes. No node labels needed for scheduling decisions.
 
 ```bash
+> **Validated CEL syntax (corrected from initial research):**
+> - Attribute keys are **top-level** (no `gpu.nvidia.com/` prefix): `device.attributes["architecture"].string`
+> - Memory is in **capacity**, not attributes: `device.capacity["memory"].value.compareTo(quantity("40000Mi")) >= 0`
+> - Value types must match: `.string`, `.version`, `.int` depending on the attribute type in ResourceSlice
+
+```bash
 # DeviceClass for H100 (whole GPU, any)
 cat <<'EOF' | oc apply -f -
 apiVersion: resource.k8s.io/v1
@@ -262,7 +268,7 @@ spec:
     - cel:
         expression: >
           device.driver == "gpu.nvidia.com" &&
-          device.attributes["gpu.nvidia.com"].architecture == "Hopper"
+          device.attributes["architecture"].string == "Hopper"
 EOF
 
 # DeviceClass for "any GPU with >= 40GB memory"
@@ -276,7 +282,7 @@ spec:
     - cel:
         expression: >
           device.driver == "gpu.nvidia.com" &&
-          device.attributes["gpu.nvidia.com"].memory >= 40000
+          device.capacity["memory"].value.compareTo(quantity("40000Mi")) >= 0
 EOF
 
 # DeviceClass for MIG 1g.10gb slice (GPUaaS I0 Sandbox tier)
@@ -290,11 +296,11 @@ spec:
     - cel:
         expression: >
           device.driver == "mig.nvidia.com" &&
-          device.attributes["gpu.nvidia.com"].profile == "1g.10gb"
+          device.attributes["profile"].string == "1g.10gb"
 EOF
 ```
 
-> **Note**: CEL attribute names depend on what the NVIDIA DRA driver publishes. Verify exact names and types against your cluster's actual `ResourceSlice` content before writing production CEL expressions.
+> **Note**: Always verify attribute names against `oc get resourceslice <name> -o json | jq '.spec.devices[0]'` on your cluster before writing CEL expressions — the exact keys and types are driver-version-dependent.
 
 ### Finding 3: ResourceClaim / ResourceClaimTemplate
 
@@ -412,7 +418,7 @@ spec:
           deviceClassName: mig.nvidia.com
           selectors:
             - cel:
-                expression: 'device.attributes["gpu.nvidia.com"].profile == "3g.40gb"'
+                expression: 'device.attributes["profile"].string == "3g.40gb"'
           count: 1
 EOF
 ```
@@ -439,8 +445,8 @@ spec:
           selectors:
             - cel:
                 expression: >
-                  device.attributes["gpu.nvidia.com"].profile == "1g.10gb" &&
-                  device.attributes["gpu.nvidia.com"].memory >= 9000
+                  device.attributes["profile"].string == "1g.10gb" &&
+                  device.capacity["memory"].value.compareTo(quantity("9000Mi")) >= 0
           count: 1
 EOF
 ```
@@ -456,7 +462,7 @@ DRA and Kueue today operate independently:
 - DRA allocates via `ResourceClaim` (no `nvidia.com/gpu` resource counted)
 - When DRA replaces the device plugin, Kueue cannot account for DRA allocations
 
-**Current workaround**: maintain both device plugin (`nvidia.com/gpu`) and DRA in parallel — the device plugin for Kueue quota counting, DRA for attribute-based scheduling. GPU Operator v26.3 supports hybrid mode on some configurations.
+**Current workaround**: none available via GPU Operator alone. `ClusterPolicy` (device plugin) and `GPUCluster` (DRA) are mutually exclusive — validated on v26.7.2. Running both simultaneously is not supported. Until DRA-in-Kueue ships, the choices are: (a) stay on ClusterPolicy + device plugin for Kueue quota support, or (b) switch to GPUCluster + DRA and lose Kueue quota accounting.
 
 **Future state**: DRA-in-Kueue (upstream KEP in progress, no downstream ETA). When shipped, Kueue will natively manage `ResourceClaim`-based workloads and quotas.
 
@@ -470,9 +476,9 @@ DRA and Kueue today operate independently:
 source ~/.ibmcloud-h200-env
 export KUBECONFIG="$INSTALL_DIR/auth/kubeconfig"
 
-# DRA CRDs (expected on OCP 4.21 without any GPU changes)
-oc get crd | grep resource.k8s.io
-# Expected: deviceclasses, resourceclaims, resourceclaimtemplates, resourceslices
+# DRA API group (built into API server — NOT CRDs, so oc get crd returns nothing)
+oc api-resources | grep resource.k8s.io
+# Expected: deviceclasses, resourceclaims, resourceclaimtemplates, resourceslices (all v1)
 
 # No ResourceSlices yet (GPU Operator v25.10 uses device plugin, not DRA)
 oc get resourceslices
@@ -482,17 +488,18 @@ oc get resourceslices
 oc create namespace poc4-dra
 ```
 
-### Step 2: Upgrade GPU Operator to v26.3
+### Step 2: Upgrade GPU Operator to v26.7
 
 ```bash
-# Update subscription to v26.3 channel
+# Update subscription to v26.7 channel (GPUCluster CRD is in v26.7, not v26.3)
 oc patch subscription gpu-operator-certified -n nvidia-gpu-operator \
-  --type=merge -p '{"spec":{"channel":"v26.3"}}'
+  --type=merge -p '{"spec":{"channel":"v26.7"}}'
 
-until oc get csv -n nvidia-gpu-operator 2>/dev/null | grep gpu-operator | grep -q Succeeded; do
+until oc get csv -n nvidia-gpu-operator 2>/dev/null | grep gpu-operator | grep "v26\.7" | grep -q Succeeded; do
   echo "  waiting..."; sleep 15
 done
-echo "GPU Operator v26.3 ready"
+oc get csv -n nvidia-gpu-operator | grep gpu-operator
+# Expected: gpu-operator-certified.v26.7.x   Succeeded
 ```
 
 ### Step 3: Migrate to GPUCluster
@@ -501,7 +508,7 @@ echo "GPU Operator v26.3 ready"
 # Delete existing ClusterPolicy (removes nvidia.com/gpu resource)
 oc delete clusterpolicy gpu-cluster-policy
 
-# Create GPUCluster (DRA path) — adjust spec to match GPU Operator v26.3 schema
+# Create GPUCluster (DRA path) — spec validated against GPU Operator v26.7 schema
 cat <<'EOF' | oc apply -f -
 apiVersion: nvidia.com/v1alpha1
 kind: GPUCluster
