@@ -65,54 +65,58 @@
 
 ## Configuration
 
+> **Validated on:** OCP 4.21.42 / K8s 1.34, GPU Operator v26.7.2, 2026-11-18
+
 ### Verify DRA Framework (already in OCP 4.21)
 
-The DRA API objects are part of OCP core — no separate install needed.
+The DRA API objects are built into OCP core — not CRDs, so `oc get crd | grep resource.k8s.io` returns nothing. Use `oc api-resources` instead.
 
 ```bash
 source ~/.ibmcloud-h200-env
 export KUBECONFIG="$INSTALL_DIR/auth/kubeconfig"
 
-# DRA CRDs (should exist on OCP 4.21 without any GPU Operator changes)
-oc get crd | grep resource.k8s.io
-# Expected:
-#   deviceclasses.resource.k8s.io
-#   resourceclaims.resource.k8s.io
-#   resourceclaimtemplates.resource.k8s.io
-#   resourceslices.resource.k8s.io
+# DRA API group (should exist on OCP 4.21 without any GPU Operator changes)
+oc api-resources | grep resource.k8s.io
+# Expected output:
+#   deviceclasses        resource.k8s.io/v1   false   DeviceClass
+#   resourceclaims       resource.k8s.io/v1   true    ResourceClaim
+#   resourceclaimtemplates  resource.k8s.io/v1  true  ResourceClaimTemplate
+#   resourceslices       resource.k8s.io/v1   false   ResourceSlice
+#
+# "No resources found" on oc get resourceslices = API present, driver not running yet
 
-# DRA feature gate is on by default in K8s 1.34
-oc get apiservers cluster -o jsonpath='{.spec.unsupportedConfigOverrides}' 2>/dev/null
-# Should be empty — no manual feature gate needed
+# DRA feature gate is on by default in K8s 1.34 — no manual configuration needed
 ```
 
-### Upgrade GPU Operator to v26.3
+### Upgrade GPU Operator to v26.7
 
-> **Warning:** This is a one-way migration. The existing `ClusterPolicy` will be replaced by `GPUCluster`. The `nvidia.com/gpu` extended resource disappears — workloads using the device plugin model must be migrated to `ResourceClaim` before or after.
+> **Important corrections from initial research:**
+> - `GPUCluster` CRD is in **v26.7** (not v26.3 as originally documented)
+> - `ClusterPolicy` and `GPUCluster` are **mutually exclusive** — not hybrid mode
+> - `GPUCluster` replaces `ClusterPolicy` and manages: DRA driver, DCGM, dcgmExporter only
+> - MIG Manager is NOT part of `GPUCluster` — requires separate management
+> - `nvidia.com/gpu` extended resource disappears when switching to GPUCluster
 
 ```bash
-# Step 1: Update the subscription channel
+# Update subscription channel to v26.7
 oc patch subscription gpu-operator-certified -n nvidia-gpu-operator \
-  --type=merge -p '{"spec":{"channel":"v26.3","installPlanApproval":"Automatic"}}'
+  --type=merge -p '{"spec":{"channel":"v26.7"}}'
 
-# Step 2: Wait for the new CSV to reach Succeeded
-until oc get csv -n nvidia-gpu-operator 2>/dev/null | grep gpu-operator | grep -q Succeeded; do
-  echo "  waiting for v26.3 CSV..."; sleep 15
+until oc get csv -n nvidia-gpu-operator 2>/dev/null | grep gpu-operator | grep "v26\.7" | grep -q Succeeded; do
+  echo "  waiting..."; sleep 15
 done
 oc get csv -n nvidia-gpu-operator | grep gpu-operator
-# Expected: gpu-operator-certified.v26.3.x   Succeeded
+# Expected: gpu-operator-certified.v26.7.x   Succeeded
 ```
 
 ### Migrate ClusterPolicy → GPUCluster (DRA enablement)
 
 ```bash
-# Step 1: Delete the existing ClusterPolicy (device plugin path)
+# Step 1: Delete the existing ClusterPolicy (required — they cannot co-exist)
 oc delete clusterpolicy gpu-cluster-policy
 
-# Step 2: Create GPUCluster (DRA path)
-# Note: GPU Operator v26.3 provides the GPUCluster CRD schema.
-# The minimal spec below enables the DRA driver for whole GPUs.
-# For MIG + DRA, see the MIG section below.
+# Step 2: Create GPUCluster — deploys ONLY the DRA driver + DCGM
+# The minimal spec (gpus: {}) enables the gpu.nvidia.com DRA kubelet plugin
 cat <<'EOF' | oc apply -f -
 apiVersion: nvidia.com/v1alpha1
 kind: GPUCluster
@@ -120,19 +124,8 @@ metadata:
   name: gpu-cluster
   namespace: nvidia-gpu-operator
 spec:
-  operator:
-    defaultRuntime: crio
-  dra:
-    enabled: true
-  driver:
-    enabled: true
-    useOpenShiftDriverToolkit: true
-  toolkit:
-    enabled: true
-  devicePlugin:
-    enabled: false   # DRA replaces the device plugin
-  gfd:
-    enabled: true    # still deployed for node metadata labels
+  draDriver:
+    gpus: {}
   dcgm:
     enabled: true
   dcgmExporter:
@@ -141,26 +134,30 @@ spec:
       enabled: true
 EOF
 
-# Step 3: Wait for GPUCluster to be ready
-until oc get gpucluster gpu-cluster -n nvidia-gpu-operator \
-  -o jsonpath='{.status.state}' 2>/dev/null | grep -q "ready"; do
-  echo "  waiting for GPUCluster ready..."; sleep 15
+# Step 3: Wait for ResourceSlices to appear
+until oc get resourceslices --no-headers 2>/dev/null | wc -l | grep -qv "^0$"; do
+  echo "  waiting for ResourceSlices..."; sleep 15
 done
-
-# Step 4: Verify ResourceSlices appear (the DRA driver published GPU inventory)
 oc get resourceslices
-# Expected: one ResourceSlice per GPU chip (8 for our H100 node)
+# Expected: 1 ResourceSlice containing all 8 H100 GPU devices
 ```
+
+> **Note:** GPUCluster does NOT manage the NVIDIA driver daemonset, container toolkit, GPU Feature Discovery, or MIG Manager. These are managed by `ClusterPolicy`. Without ClusterPolicy:
+> - `nvidia.com/gpu` extended resource disappears
+> - MIG Manager is not running (static MIG must be pre-configured and persists)
+> - Container toolkit is not running (CDI library injection requires toolkit or manual CDI setup)
+>
+> To restore the full stack, delete GPUCluster and recreate ClusterPolicy (see Full Cleanup).
 
 ### Static MIG + DRA
 
-Pre-configure MIG geometry using the node label approach from `mig/poc.md`. Once the MIG slices exist in hardware, the DRA driver discovers them and publishes `mig.nvidia.com` ResourceSlice entries — no additional configuration needed.
+> **Important limitation (validated 2026-11-18):** `GPUCluster` does NOT deploy MIG Manager. MIG geometry must be pre-configured via node labels BEFORE switching to GPUCluster (while ClusterPolicy is still running). Once GPUCluster is active, the pre-existing MIG geometry persists in hardware, and the DRA driver publishes `mig.nvidia.com` ResourceSlice entries.
 
 ```bash
-# 1. Enable MIG (custom-mixed layout) as documented in mig/poc.md
-#    After state=success, the DRA driver auto-discovers the slices
+# 1. While ClusterPolicy is still active, enable MIG (from mig/poc.md)
+#    After state=success, switch to GPUCluster
 
-# 2. Verify MIG slices appear as DRA devices
+# 2. After GPUCluster is active, verify MIG slices appear as DRA devices
 oc get resourceslices -o json | jq '
   .items[] | select(.spec.driver=="mig.nvidia.com") | {
     node: .spec.nodeName,
@@ -171,10 +168,9 @@ oc get resourceslices -o json | jq '
 
 ### Dynamic MIG + DRA (Tech Preview — OCP 4.21)
 
-Dynamic MIG allows the scheduler to request MIG partitions on-demand per `ResourceClaim`, eliminating the drain-reconfigure-drain cycle. Requires enabling the `DRAPartitionableDevices` feature gate.
+Dynamic MIG allows the scheduler to request MIG partitions on-demand per `ResourceClaim`. Requires enabling the `DRAPartitionableDevices` feature gate (Tech Preview — breaks supportability boundary).
 
 ```bash
-# Enable feature gate on kube-apiserver and kube-scheduler (Tech Preview — not for production)
 oc patch apiservers cluster --type=merge -p '{
   "spec": {
     "unsupportedConfigOverrides": {
@@ -193,7 +189,6 @@ oc patch scheduler cluster --type=merge -p '{
     }
   }
 }'
-# Note: "unsupportedConfigOverrides" = Tech Preview / breaks supportability boundary
 ```
 
 ---
@@ -202,7 +197,9 @@ oc patch scheduler cluster --type=merge -p '{
 
 ### Finding 1: ResourceSlice — GPU Inventory Layer
 
-The NVIDIA DRA driver publishes one `ResourceSlice` per GPU chip (whole GPU path) or per MIG slice (MIG path). Each device entry contains structured attributes:
+> **Validated on:** OCP 4.21.42, GPU Operator v26.7.2, 2026-11-18
+
+The NVIDIA DRA driver publishes **one ResourceSlice containing all GPU devices** per node (not one per chip as originally described). Each device entry contains structured attributes:
 
 ```bash
 # Inspect a ResourceSlice
@@ -210,29 +207,42 @@ RS=$(oc get resourceslices -o jsonpath='{.items[0].metadata.name}')
 oc get resourceslice ${RS} -o json | jq '{
   node: .spec.nodeName,
   driver: .spec.driver,
-  devices: [.spec.devices[] | {name: .name, attributes: .basic.attributes}]
+  devices: [.spec.devices[] | {name: .name, attributes: .attributes, capacity: .capacity}]
 }'
 ```
 
-**H100 device attributes** (published by `gpu.nvidia.com` driver):
+**Actual H100 device attributes** (from `gpu.nvidia.com` driver on our cluster):
 
-| Attribute | Example value |
-|---|---|
-| `gpu.nvidia.com/productName` | `"NVIDIA H100 80GB HBM3"` |
-| `gpu.nvidia.com/architecture` | `"Hopper"` |
-| `gpu.nvidia.com/cudaComputeCapability` | `"9.0"` |
-| `gpu.nvidia.com/memory` | `81920` (MiB) |
-| `gpu.nvidia.com/uuid` | `"GPU-8ea59646-..."` |
-| `gpu.nvidia.com/driverVersion` | `"580.105.08"` |
+> **Correction from research:** Attribute keys do NOT use the `gpu.nvidia.com/` prefix in the actual ResourceSlice. They are top-level keys. Memory is in `.capacity.memory`, not in `.attributes`.
 
-**MIG slice attributes** (published by `mig.nvidia.com` driver):
+```json
+{
+  "name": "gpu-3",
+  "attributes": {
+    "addressingMode": {"string": "HMM"},
+    "architecture":   {"string": "Hopper"},
+    "brand":          {"string": "Nvidia"},
+    "cudaComputeCapability": {"version": "9.0.0"},
+    "cudaDriverVersion":     {"version": "13.0.0"},
+    "driverVersion":         {"version": "580.105.8"},
+    "productName":           {"string": "NVIDIA H100 80GB HBM3"},
+    "resource.kubernetes.io/numaNode":  {"int": 0},
+    "resource.kubernetes.io/pciBusID": {"string": "0000:c1:00.0"},
+    "type": {"string": "gpu"},
+    "uuid": {"string": "GPU-77459654-6751-15a3-20bd-439dcc9e1bdc"}
+  },
+  "capacity": {
+    "memory": {"value": "81559Mi"}
+  }
+}
+```
 
-| Attribute | Example value |
-|---|---|
-| `gpu.nvidia.com/profile` | `"1g.10gb"` |
-| `gpu.nvidia.com/parentUUID` | `"GPU-8ea59646-..."` |
-| `gpu.nvidia.com/memory` | `9984` (MiB) |
-| `gpu.nvidia.com/multiprocessors` | `16` |
+**CEL attribute access** (corrected from research):
+```
+# WRONG (research doc):  device.attributes["gpu.nvidia.com"].architecture
+# CORRECT (validated):   device.attributes["architecture"].string
+#                        device.capacity["memory"]
+```
 
 **GPUaaS billing implication**: ResourceSlices replace manual GPU counting. The entitlement controller reads ResourceSlice data to know what physical capacity exists — no polling `nvidia.com/gpu` node labels required.
 
@@ -340,7 +350,12 @@ EOF
 
 ### Finding 4: DRAPrioritizedList (`firstAvailable`) — Graceful Degradation
 
+> **Validated on:** OCP 4.21.42, 2026-11-18. Correct syntax confirmed.
+
 ```bash
+# Correct firstAvailable syntax (validated): each item needs both 'name' and 'deviceClassName'
+# WRONG: nesting under 'exactly' block — rejected by API
+# CORRECT: flat structure with 'name' (RFC 1123 label) + 'deviceClassName' + 'count'
 cat <<'EOF' | oc apply -f -
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
@@ -353,15 +368,15 @@ spec:
       - name: gpu
         firstAvailable:
           - name: prefer-h100
-            exactly:
-              deviceClassName: nvidia-h100
-              count: 1
+            deviceClassName: nvidia-h100
+            count: 1
           - name: fallback-any
-            exactly:
-              deviceClassName: gpu-large-memory
-              count: 1
+            deviceClassName: gpu-large-memory
+            count: 1
 EOF
 ```
+
+**Validated result**: The DRA scheduler selected `prefer-h100` (confirmed in kubelet plugin logs: `[gpu/prefer-h100] ocp-h200-0 gpu-4`). The H100 was chosen over the fallback because it matched the `nvidia-h100` DeviceClass first.
 
 **GPUaaS mapping**: O1 (flex/queued) tenant contract — "I want H100 but accept A100". The scheduler tries in priority order without the tenant needing hardware awareness.
 
@@ -541,6 +556,8 @@ oc get resourceslice ${RS} -o json | jq '{
 
 ### Step 5: Create DeviceClasses for GPUaaS Tiers
 
+> **Correction from research:** CEL attribute access is `device.attributes["architecture"].string`, NOT `device.attributes["gpu.nvidia.com"].architecture`. Memory is in `device.capacity["memory"]`.
+
 ```bash
 # I1 — whole H100 (Serve)
 cat <<'EOF' | oc apply -f -
@@ -553,7 +570,21 @@ spec:
     - cel:
         expression: >
           device.driver == "gpu.nvidia.com" &&
-          device.attributes["gpu.nvidia.com"].architecture == "Hopper"
+          device.attributes["architecture"].string == "Hopper"
+EOF
+
+# Any GPU with >= 40GB memory
+cat <<'EOF' | oc apply -f -
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: gpu-large-memory
+spec:
+  selectors:
+    - cel:
+        expression: >
+          device.driver == "gpu.nvidia.com" &&
+          device.capacity["memory"].value.compareTo(quantity("40000Mi")) >= 0
 EOF
 
 # I0 — MIG 1g.10gb slice (Sandbox)
@@ -567,7 +598,7 @@ spec:
     - cel:
         expression: >
           device.driver == "mig.nvidia.com" &&
-          device.attributes["gpu.nvidia.com"].profile == "1g.10gb"
+          device.attributes["profile"].string == "1g.10gb"
 EOF
 
 oc get deviceclass
@@ -650,18 +681,81 @@ spec:
 EOF
 ```
 
+## Validation Summary (2026-11-18)
+
+| Check | Result | Notes |
+|---|---|---|
+| DRA framework on OCP 4.21.42 | ✅ `resource.k8s.io/v1` GA | Use `oc api-resources`, not `oc get crd` |
+| GPU Operator version for GPUCluster | ✅ **v26.7** (not v26.3) | v26.3 has the CRD but GPUCluster is in v26.7 |
+| ClusterPolicy + GPUCluster co-exist | ❌ Mutually exclusive | Error: "ClusterPolicy and GPUCluster cannot co-exist" |
+| ResourceSlice published | ✅ 1 slice with 8 devices | One ResourceSlice per node (not per GPU chip) |
+| H100 attributes in ResourceSlice | ✅ productName, architecture=Hopper, memory=81559Mi, cudaCC=9.0 | Attribute keys: no `gpu.nvidia.com/` prefix |
+| DeviceClass with CEL selectors | ✅ Created and accepted | Attribute syntax: `device.attributes["architecture"].string` |
+| ResourceClaim allocation | ✅ Allocated and pod ran nvidia-smi -L | UUID-matched GPU confirmed |
+| `firstAvailable` syntax | ✅ `name` + `deviceClassName` + `count` (flat) | No `exactly` nesting |
+| `firstAvailable` priority selection | ✅ `prefer-h100` chosen over fallback | Confirmed in DRA driver kubelet plugin logs |
+| MIG Manager in GPUCluster | ❌ Not managed | MIG Manager is ClusterPolicy-only in v26.7 |
+| Static MIG + DRA | 🔶 Not fully validated | Requires pre-existing MIG + GPUCluster active simultaneously |
+| CDI library injection (toolkit-less) | ⚠️ Partial | Works for some claims; NVIDIA toolkit needed for reliable injection |
+
+---
+
 ### Full Cleanup
 
 ```bash
-oc delete pods --all -n poc4-dra
-oc delete jobs --all -n poc4-dra
-oc delete resourceclaims --all -n poc4-dra
-oc delete resourceclaimtemplates --all -n poc4-dra
-oc delete namespace poc4-dra
+oc delete pods --all -n poc4-dra 2>/dev/null || true
+oc delete jobs --all -n poc4-dra 2>/dev/null || true
+oc delete resourceclaims --all -n poc4-dra 2>/dev/null || true
+oc delete resourceclaimtemplates --all -n poc4-dra 2>/dev/null || true
+oc delete namespace poc4-dra --ignore-not-found
 oc delete deviceclass nvidia-h100 nvidia-mig-1g10gb gpu-large-memory --ignore-not-found
 
-# To revert to device plugin path: delete GPUCluster, recreate ClusterPolicy
-# (see ibmc/openshift-h200-provisioning.md Part D for ClusterPolicy YAML)
+# Revert to ClusterPolicy (restores nvidia.com/gpu, toolkit, MIG Manager, GFD)
+oc delete gpucluster gpu-cluster 2>/dev/null || true
+sleep 10
+# Recreate ClusterPolicy — see ibmc/openshift-h200-provisioning.md Part D for full YAML
+cat <<'EOF' | oc apply -f -
+apiVersion: nvidia.com/v1
+kind: ClusterPolicy
+metadata:
+  name: gpu-cluster-policy
+spec:
+  operator:
+    defaultRuntime: crio
+    use_ocp_driver_toolkit: true
+  daemonsets: {}
+  nodeStatusExporter:
+    enabled: true
+  driver:
+    enabled: true
+  toolkit:
+    enabled: true
+  devicePlugin:
+    enabled: true
+  dcgm:
+    enabled: true
+  dcgmExporter:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+  gfd:
+    enabled: true
+  migManager:
+    enabled: true
+    config:
+      name: default-mig-parted-config
+  validator:
+    plugin:
+      env:
+        - name: WITH_WORKLOAD
+          value: "false"
+EOF
+
+until oc get clusterpolicy gpu-cluster-policy -o jsonpath='{.status.state}' 2>/dev/null | grep -q "ready"; do
+  echo "  restoring..."; sleep 15
+done
+oc get node ocp-h200-0 -o jsonpath='{.status.allocatable}' | jq . | grep nvidia
+# Expected: nvidia.com/gpu: 8
 ```
 
 ---
