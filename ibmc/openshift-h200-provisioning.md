@@ -53,17 +53,17 @@ ibmcloud plugin install cloud-object-storage -f    # COS (for the bootstrap igni
 brew install jq helm awscli            # aws CLI is only used for COS presigned URLs
 ```
 
-Install a **matching** `openshift-install` and `oc` (keep them the same minor version). Example with 4.21 on macOS Apple Silicon (swap `arm64`→`amd64` on Intel/Linux):
+Install a **matching** `openshift-install` and `oc` (keep them the same minor version). Example with 4.22 on macOS Apple Silicon (swap `arm64`→`amd64` on Intel/Linux):
 
 ```bash
-BASEURL=https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-4.21
+BASEURL=https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-4.22
 curl -L "$BASEURL/openshift-install-mac-arm64.tar.gz" | tar -xz -C /tmp openshift-install
 curl -L "$BASEURL/openshift-client-mac-arm64.tar.gz"  | tar -xz -C /tmp oc kubectl
 sudo mv /tmp/openshift-install /tmp/oc /tmp/kubectl /usr/local/bin/ && sudo chmod +x /usr/local/bin/{openshift-install,oc,kubectl}
 openshift-install version && oc version --client
 ```
 
-Verify the downloaded versions are 4.21.x:
+Verify the downloaded versions are 4.22.x:
 ```bash
 openshift-install version | grep openshift-install
 oc version --client | grep Client
@@ -670,7 +670,7 @@ apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata: {name: gpu-operator-certified, namespace: nvidia-gpu-operator}
 spec:
-  channel: v25.10
+  channel: v26.7
   installPlanApproval: Automatic
   name: gpu-operator-certified
   source: certified-operators
