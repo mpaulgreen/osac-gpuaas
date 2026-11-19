@@ -13,7 +13,8 @@ Knowledgebase for the **GPU-as-a-Service (GPUaaS) prototype** on IBM Cloud VPC. 
 | `ibmc/install-certificates.md` | Let's Encrypt TLS via cert-manager + IBM CIS DNS-01 webhook |
 | `mig/poc.md` | MIG partitioning research notes — isolation, telemetry, reconfiguration, RHOAI integration (all validated on H100) |
 | `mig/rhoai-3.5-deploy.md` | RHOAI 3.5 deployment guide (prerequisite for MIG exercises 3.4+) |
-| `dra/poc.md` | Dynamic Resource Allocation (DRA) research notes (WIP) |
+| `dra/poc.md` | Dynamic Resource Allocation (DRA) research notes — Phase 1 (fundamentals, all validated on OCP 4.22) |
+| `dra/phase2.md` | DRA Phase 2 — exhaustive proof-out (GPU sharing, multi-tenant quota, multi-GPU constraints, Kueue bridge) |
 
 ---
 
@@ -26,7 +27,7 @@ Knowledgebase for the **GPU-as-a-Service (GPUaaS) prototype** on IBM Cloud VPC. 
 | **OCP version** | 4.22.22 |
 | **Control plane** | 3 × `bx2-8x32` masters |
 | **GPU worker** | 1 × `gx3d-160x1792x8h100` — 8 × H100 80GB HBM3 |
-| **GPU Operator** | v26.7.2, GPUCluster + NvidiaDriver (DRA mode) |
+| **GPU Operator** | v26.7.3, ClusterPolicy (device-plugin mode) |
 | **RHOAI** | 3.5.3, DSC `Ready` |
 | **TLS** | Let's Encrypt via cert-manager + IBM CIS webhook |
 | **FeatureSet** | `TechPreviewNoUpgrade` (DRAPartitionableDevices active) |
