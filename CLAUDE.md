@@ -28,7 +28,7 @@ dra/
 
 - **Account**: Ecosystem AI workloads (IBM Cloud 3179756), `ca-tor` / `ca-tor-3`
 - **Cluster**: OCP 4.22.22 (K8s 1.35), 3 masters (bx2-8x32) + 1 H100 worker (gx3d-160x1792x8h100)
-- **GPU**: 8 × H100 80GB HBM3, `nvidia.com/gpu: 8` schedulable, GPU Operator v26.7.2 (ClusterPolicy mode)
+- **GPU**: 8 × H100 80GB HBM3, `nvidia.com/gpu: 8` schedulable, GPU Operator v26.7.3 (ClusterPolicy mode)
 - **Stack**: RHOAI 3.5.3, RHCL 1.4.3, cert-manager 1.20.1, COO 1.5.5, OTel, NFD
 - **MIG PoC**: All exercises (3.1–3.6) validated and documented in `mig/poc.md`
 - **DRA PoC**: All exercises validated and documented in `dra/poc.md` (DynamicMIG proven on OCP 4.22)
