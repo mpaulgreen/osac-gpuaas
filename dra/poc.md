@@ -8,13 +8,14 @@
 
 ## Prerequisites
 
-- **OCP 4.21.42** (K8s 1.34) — DRA GA, `resource.k8s.io/v1`, `DynamicResourceAllocation` on by default
+- **OCP 4.21.42** (K8s 1.34) — DRA GA, `resource.k8s.io/v1`, `DynamicResourceAllocation` on by default. Whole-GPU DRA path validated here.
+- **OCP 4.22.22** (K8s 1.35) — MIG+DRA path validated here. Requires `TechPreviewNoUpgrade` FeatureSet to unlock `DRAPartitionableDevices`.
 - **GPU Operator v26.7** — required. Provides two CRDs: `GPUCluster` (DRA driver) and `NvidiaDriver` (kernel driver). Both are needed for the full DRA stack.
 - **No NGC credentials needed** — `NvidiaDriver` CR uses OCP Driver Toolkit (DTK) to build the driver in-cluster from `quay.io/openshift-release-dev` (included in OCP pull secret). No `nvcr.io` access required.
 - **Red Hat operator coverage**: DRA framework in OCP core (Red Hat). NVIDIA DRA driver in `gpu-operator-certified` v26.7 (certified-operators catalog — OLM-managed, no Helm).
 - `ClusterPolicy` and `GPUCluster` are **mutually exclusive** — both are permanently irreversible once created; `ClusterPolicy` must be deleted before `GPUCluster` can be applied.
 - **Known K8s 1.34 DRA bug**: 1.34.0 and 1.34.1 have a scheduler bug. Verify OCP patch level is 4.21.3+ before enabling.
-- **MIG + DRA**: Static MIG geometry discovery and DynamicMIG both require `DRAPartitionableDevices` feature gate — NOT available in OCP 4.21 `TechPreviewNoUpgrade` (added in OCP 4.22). See TODO section.
+- **MIG + DRA**: Static MIG geometry discovery and DynamicMIG both require `DRAPartitionableDevices` feature gate — NOT available in OCP 4.21 `TechPreviewNoUpgrade` (added in OCP 4.22). See OCP 4.22 Validation section.
 
 ---
 
@@ -67,7 +68,7 @@
 
 ## Configuration
 
-> **Validated on:** OCP 4.21.42 / K8s 1.34, GPU Operator v26.7.2, 2026-11-18
+> **Validated on:** OCP 4.21.42 / K8s 1.34 (whole-GPU path) and OCP 4.22.22 / K8s 1.35 (MIG+DRA path), GPU Operator v26.7.2, 2026-11-18
 
 ### Verify DRA Framework (already in OCP 4.21)
 
@@ -244,7 +245,7 @@ oc patch gpucluster gpu-cluster --type=merge -p '{
 # No pre-configured MIG geometry needed — DRAPartitionableDevices enables partitioning API
 ```
 
-See the **TODO — OCP 4.22** section for full DynamicMIG validation steps.
+See the **OCP 4.22 Validation — Completed** section for full DynamicMIG validation steps.
 
 ---
 
@@ -296,12 +297,17 @@ oc get resourceslice ${RS} -o json | jq '{
 }
 ```
 
-**CEL attribute access** (corrected from research):
+**CEL attribute access** (K8s 1.34 / OCP 4.21, whole-GPU devices):
 ```
-# WRONG (research doc):  device.attributes["gpu.nvidia.com"].architecture
-# CORRECT (validated):   device.attributes["architecture"].string
-#                        device.capacity["memory"]
+# WRONG:   device.attributes["gpu.nvidia.com"].architecture   ← domain lookup on flat map fails
+# CORRECT: device.attributes["architecture"].string           ← flat map, explicit type accessor
+#          device.capacity["memory"]                          ← memory is in capacity, not attributes
 ```
+
+> **K8s 1.35 / OCP 4.22 — MIG devices use domain-keyed access (different structure):**
+> `device.attributes['gpu.nvidia.com'].profile == '1g.10gb'`
+> No `.string` accessor — K8s 1.35 auto-unwraps to native CEL types.
+> See Finding 6 and the OCP 4.22 Validation section for details.
 
 **GPUaaS billing implication**: ResourceSlices replace manual GPU counting. The entitlement controller reads ResourceSlice data to know what physical capacity exists — no polling `nvidia.com/gpu` node labels required.
 
@@ -345,6 +351,8 @@ spec:
 EOF
 
 # DeviceClass for MIG 1g.10gb slice (GPUaaS I0 Sandbox tier)
+# Note: device.attributes['gpu.nvidia.com'].profile is the K8s 1.35 / OCP 4.22 syntax (domain-keyed)
+# The has() guard is required — whole-GPU devices in the same ResourceSlice have no .profile attribute
 cat <<'EOF' | oc apply -f -
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
@@ -355,7 +363,8 @@ spec:
     - cel:
         expression: >
           device.driver == "mig.nvidia.com" &&
-          device.attributes["profile"].string == "1g.10gb"
+          has(device.attributes['gpu.nvidia.com'].profile) &&
+          device.attributes['gpu.nvidia.com'].profile == '1g.10gb'
 EOF
 ```
 
@@ -477,7 +486,7 @@ spec:
           deviceClassName: mig.nvidia.com
           selectors:
             - cel:
-                expression: 'device.attributes["profile"].string == "3g.40gb"'
+                expression: "has(device.attributes['gpu.nvidia.com'].profile) && device.attributes['gpu.nvidia.com'].profile == '3g.40gb'"
           count: 1
 EOF
 ```
@@ -486,7 +495,14 @@ Different workloads can claim different MIG profile sizes from the same node sim
 
 ### Finding 6: Dynamic MIG — On-Demand Partitioning (Tech Preview)
 
-With `DRAPartitionableDevices` enabled, the scheduler can request MIG partitions be created on-demand per claim:
+> **Validated on:** OCP 4.22.22 / K8s 1.35, GPU Operator v26.7.2, 2026-11-18
+
+With `DRAPartitionableDevices` enabled (OCP 4.22 `TechPreviewNoUpgrade`), the DRA driver creates MIG partitions on-demand per ResourceClaim.
+
+**CEL syntax (K8s 1.35 / OCP 4.22):**
+- `device.attributes` is domain-keyed: `device.attributes['gpu.nvidia.com']` returns the NVIDIA attribute namespace
+- `.profile` accesses the profile attribute within that namespace — no `.string` accessor (K8s 1.35 auto-unwraps)
+- `has()` guard is required: whole-GPU devices in the same ResourceSlice (`gpu-7`, `gpu-6`, etc.) do NOT have a `.profile` attribute. Without `has()`, the CEL fails when evaluated against whole-GPU devices.
 
 ```bash
 cat <<'EOF' | oc apply -f -
@@ -504,11 +520,13 @@ spec:
           selectors:
             - cel:
                 expression: >
-                  device.attributes["profile"].string == "1g.10gb" &&
-                  device.capacity["memory"].value.compareTo(quantity("9000Mi")) >= 0
+                  has(device.attributes['gpu.nvidia.com'].profile) &&
+                  device.attributes['gpu.nvidia.com'].profile == '1g.10gb'
           count: 1
 EOF
 ```
+
+**Validated result (OCP 4.22.22, 2026-11-18):** DRA driver allocated `gpu-7-mig-1g10gb-19-0`. Pod ran with `nvidia-smi` showing MIG mode and ~9.5 GB memory. No pre-configured MIG geometry needed — DRA driver partitioned on-demand.
 
 The DRA driver receives the claim, calls nvidia-smi to carve the requested profile from an available GPU, and the pod is scheduled to it. **No node label changes, no drain, no reconfigure downtime.**
 
@@ -657,6 +675,7 @@ spec:
 EOF
 
 # I0 — MIG 1g.10gb slice (Sandbox) — requires DRAPartitionableDevices (OCP 4.22+)
+# Uses domain-keyed CEL syntax (K8s 1.35). has() guard needed — whole-GPU devices have no .profile.
 cat <<'EOF' | oc apply -f -
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
@@ -667,7 +686,8 @@ spec:
     - cel:
         expression: >
           device.driver == "mig.nvidia.com" &&
-          device.attributes["profile"].string == "1g.10gb"
+          has(device.attributes['gpu.nvidia.com'].profile) &&
+          device.attributes['gpu.nvidia.com'].profile == '1g.10gb'
 EOF
 
 oc get deviceclass
@@ -740,15 +760,20 @@ oc get resourceclaim h100-claim -n poc4-dra \
 > **OCP 4.21 limitation:** `mig.nvidia.com` ResourceSlices do NOT appear on OCP 4.21 even when
 > MIG is configured in hardware. The DRA driver requires `DRAPartitionableDevices` gate to publish
 > MIG partition information. This gate is only in `TechPreviewNoUpgrade` on OCP 4.22+.
-> See TODO section for the OCP 4.22 validation steps.
+> See **OCP 4.22 Validation — Completed** section for full results.
 
 On OCP 4.22 (after enabling `TechPreviewNoUpgrade`):
 ```bash
-# Verify MIG slices appear as DRA devices (correct jq path: .attributes not .basic.attributes)
+# Verify MIG slices appear as DRA devices
+# On K8s 1.35, MIG device attributes are domain-keyed in JSON: .attributes["gpu.nvidia.com"]["profile"]
 oc get resourceslices -o json | jq '
   .items[] | select(.spec.driver=="mig.nvidia.com") | {
     node: .spec.nodeName,
-    slices: [.spec.devices[] | {name: .name, profile: .attributes["profile"].string}]
+    deviceCount: (.spec.devices | length),
+    slices: [.spec.devices[] | {
+      name: .name,
+      profile: .attributes["gpu.nvidia.com"]["profile"].string
+    }]
   }'
 
 # Schedule a pod to a specific MIG slice via ResourceClaim
@@ -792,9 +817,25 @@ EOF
 | FeatureGate permanence gotcha | ⚠️ | TechPreviewNoUpgrade AND CustomNoUpgrade both permanently irreversible once set |
 | nvidia RuntimeClass | ❌ Not present in DRA mode | Toolkit creates it; toolkit not deployed in GPUCluster path |
 
+**OCP 4.22.22 / K8s 1.35 results (validated 2026-11-18):**
+
+| Check | Result | Notes |
+|---|---|---|
+| `TechPreviewNoUpgrade` enables `DRAPartitionableDevices` | ✅ OCP 4.22 | kube-apiserver rollout ~5 min; DRA driver logs no longer show "fields dropped" |
+| `mig.nvidia.com` ResourceSlices with DynamicMIG | ✅ OCP 4.22 | 26 devices per chip: whole GPU + all MIG profile combinations + `consumesCounters` |
+| DynamicMIG: on-demand partition for `1g.10gb` | ✅ OCP 4.22 | Allocated `gpu-7-mig-1g10gb-19-0`; pod output `POD-1G SUCCESS` |
+| DynamicMIG: simultaneous `1g.10gb` + `2g.20gb` isolation | ✅ OCP 4.22 | GI 19-0 vs GI 14-2; different memory (~9.5 GB vs ~19.5 GB); no node label changes |
+| DynamicMIG teardown | ✅ OCP 4.22 | `nvidia-smi mig -lgi` empty after claim deletion |
+| Correct MIG CEL syntax on K8s 1.35 | ✅ | `device.attributes['gpu.nvidia.com'].profile == '1g.10gb'` (domain-keyed, no `.string`) |
+| `has()` guard required for profile | ✅ | Whole-GPU devices (`gpu-7`, `gpu-6`...) have no `.profile` → guard prevents CEL panic |
+| Static MIG + DRA (node label → ResourceSlice) | ✅ Finding confirmed | `mig.nvidia.com` ResourceSlices require `DynamicMIG: true` — no separate static mode exists. DynamicMIG allocates from existing geometry when available. |
+| ClusterPolicy restore (Full Cleanup) | ✅ OCP 4.22 | `nvidia.com/gpu: 8`, MIG `all-disabled`, ClusterPolicy `ready` |
+
 ---
 
 ### Full Cleanup
+
+> **Validated on:** OCP 4.22.22, 2026-11-19. Result: `nvidia.com/gpu: 8`, MIG `all-disabled`, ClusterPolicy `ready`.
 
 ```bash
 oc delete pods --all -n poc4-dra 2>/dev/null || true
@@ -879,12 +920,11 @@ oc get node ocp-h200-0 -o jsonpath='{.status.allocatable}' | jq . | grep nvidia
 
 ---
 
-## TODO — OCP 4.22
+## OCP 4.22 Validation — Completed
 
-The following validations could not be completed on OCP 4.21 because `DRAPartitionableDevices`
-is not in OCP 4.21's `TechPreviewNoUpgrade` catalog (it was added in OCP 4.22). Additionally,
-both `TechPreviewNoUpgrade` and `CustomNoUpgrade` are permanently irreversible once set on OCP 4.21,
-preventing switching between them.
+> **Status:** All items validated on OCP 4.22.22 / K8s 1.35, GPU Operator v26.7.2, 2026-11-18.
+> These validations could not be done on OCP 4.21 because `DRAPartitionableDevices` is not in
+> OCP 4.21's `TechPreviewNoUpgrade` catalog. A fresh OCP 4.22 cluster was provisioned.
 
 ### Enable on OCP 4.22
 
@@ -892,27 +932,39 @@ On OCP 4.22, `DRAPartitionableDevices` is included in `TechPreviewNoUpgrade`:
 
 ```bash
 oc patch featuregate cluster --type=merge -p '{"spec":{"featureSet":"TechPreviewNoUpgrade"}}'
+# PERMANENT: TechPreviewNoUpgrade is irreversible. It cannot be changed back and blocks minor
+# version upgrades. Apply only after the cluster is provisioned and stable.
 # Triggers rolling restart of kube-apiserver and kube-scheduler (~5 min)
-# Note: TechPreviewNoUpgrade is still permanently irreversible (blocks minor version upgrades)
+until oc get clusteroperator kube-apiserver -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}' | grep -q True; do sleep 5; done
+until oc get clusteroperator kube-apiserver -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}' | grep -q False; do sleep 15; done
+echo "kube-apiserver rollout complete"
 ```
 
-Verify DRA driver no longer logs "fields dropped: DRAPartitionableDevices":
+Verify DRA driver no longer drops DRAPartitionableDevices fields:
 ```bash
 oc logs -n nvidia-gpu-operator -l app=nvidia-dra-driver-kubelet-plugin --tail=10 | grep -i "dropped\|DRAPartition"
 # Expected: no matches
 ```
 
-### 1. DynamicMIG — On-Demand MIG Partitioning
+### 1. DynamicMIG — On-Demand MIG Partitioning ✅
 
-Enable in GPUCluster and submit a `mig.nvidia.com` ResourceClaim:
+Enable DynamicMIG in GPUCluster and submit a `mig.nvidia.com` ResourceClaim:
 ```bash
-oc patch gpucluster gpu-cluster --type=merge -p '{"spec":{"draDriver":{"featureGates":{"DynamicMIG":true},"gpus":{}}}}'
+oc patch gpucluster gpu-cluster --type=merge -p \
+  '{"spec":{"draDriver":{"featureGates":{"DynamicMIG":true},"gpus":{}}}}'
+# Wait for GPU Operator to restart DRA driver pod (~30s)
+
+# Label namespace to allow privileged pods (DRA + hostPath volumes need this)
+oc label namespace poc4-dra \
+  pod-security.kubernetes.io/enforce=privileged \
+  pod-security.kubernetes.io/warn=privileged \
+  pod-security.kubernetes.io/audit=privileged --overwrite
 
 cat <<'EOF' | oc apply -f -
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
 metadata:
-  name: mig-dynamic-1g10gb
+  name: mig-pod-1g
   namespace: poc4-dra
 spec:
   devices:
@@ -922,41 +974,151 @@ spec:
           deviceClassName: mig.nvidia.com
           selectors:
             - cel:
-                expression: 'device.attributes["profile"].string == "1g.10gb"'
+                expression: "has(device.attributes['gpu.nvidia.com'].profile) && device.attributes['gpu.nvidia.com'].profile == '1g.10gb'"
           count: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mig-pod-1g
+  namespace: poc4-dra
+spec:
+  containers:
+    - name: cuda
+      image: nvcr.io/nvidia/cuda:12.6.3-base-ubi9
+      command: ["sh", "-c", "nvidia-smi && echo 'POD-1G SUCCESS'"]
+      resources:
+        claims:
+          - name: mig-slice
+      volumeMounts:
+        - name: nvidia-libs
+          mountPath: /usr/local/nvidia/lib
+      env:
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib
+  resourceClaims:
+    - name: mig-slice
+      resourceClaimName: mig-pod-1g
+  volumes:
+    - name: nvidia-libs
+      hostPath:
+        path: /run/nvidia/driver/usr/lib
+  restartPolicy: Never
 EOF
 ```
 
-Observe: DRA driver creates the MIG partition on-demand, `mig.nvidia.com` ResourceSlice appears,
-pod schedules and gets isolated slice. No pre-configured MIG geometry needed.
+**Validated result:** DRA driver allocated `gpu-7-mig-1g10gb-19-0`. Pod completed with `POD-1G SUCCESS`. `nvidia-smi` showed MIG mode enabled, ~9.5 GB memory. No pre-configured MIG geometry was needed.
 
-### 2. Two-Pod Simultaneous MIG Isolation
+### 2. Two-Pod Simultaneous MIG Isolation ✅
 
-Submit one `1g.10gb` and one `2g.20gb` claim simultaneously. Expected:
-- Different GI IDs (hardware isolation confirmed)
-- Pod A sees ~9.5 GB, Pod B sees ~19.5 GB
-- Both run without any node label changes
-
-### 3. DynamicMIG Teardown
-
-After pods complete, verify MIG instance is destroyed:
+Submit `1g.10gb` and `2g.20gb` claims simultaneously:
 ```bash
-oc exec -n nvidia-gpu-operator <driver-pod> -c nvidia-driver-ctr -- nvidia-smi mig -lgi
-# Expected: No MIG instances (released by DRA driver after claim deletion)
+cat <<'EOF' | oc apply -f -
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: mig-pod-2g
+  namespace: poc4-dra
+spec:
+  devices:
+    requests:
+      - name: mig-slice
+        exactly:
+          deviceClassName: mig.nvidia.com
+          selectors:
+            - cel:
+                expression: "has(device.attributes['gpu.nvidia.com'].profile) && device.attributes['gpu.nvidia.com'].profile == '2g.20gb'"
+          count: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mig-pod-2g
+  namespace: poc4-dra
+spec:
+  containers:
+    - name: cuda
+      image: nvcr.io/nvidia/cuda:12.6.3-base-ubi9
+      command: ["sh", "-c", "nvidia-smi && echo 'POD-2G SUCCESS'"]
+      resources:
+        claims:
+          - name: mig-slice
+      volumeMounts:
+        - name: nvidia-libs
+          mountPath: /usr/local/nvidia/lib
+      env:
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib
+  resourceClaims:
+    - name: mig-slice
+      resourceClaimName: mig-pod-2g
+  volumes:
+    - name: nvidia-libs
+      hostPath:
+        path: /run/nvidia/driver/usr/lib
+  restartPolicy: Never
+EOF
+
+# Monitor both pods
+oc get pods -n poc4-dra -w
 ```
 
-### 4. Static MIG + DRA (without manual nvidia-smi)
+**Validated result:**
+- `mig-pod-1g` → `gpu-7-mig-1g10gb-19-0` (GI 19-0, ~9.5 GB)
+- `mig-pod-2g` → `gpu-7-mig-2g20gb-14-2` (GI 14-2, ~19.5 GB)
+- Both pods `Completed`. Hardware isolation confirmed: different GI IDs, different profiles.
+- No node label changes were needed during the entire test.
 
-On OCP 4.22, with `DRAPartitionableDevices` enabled, pre-configured MIG instances appear automatically
-as `mig.nvidia.com` ResourceSlices when MIG geometry is set via node labels (no manual nvidia-smi
-commands needed). Validate the full CEL-based selection path.
+### 3. DynamicMIG Teardown ✅
 
-### 5. OCP Version Roadmap
+After pods complete, verify MIG instances are destroyed:
+```bash
+# Find the NvidiaDriver pod (not the GPU Operator pod)
+DRIVER_POD=$(oc get pods -n nvidia-gpu-operator -l app=nvidia-driver-daemonset -o jsonpath='{.items[0].metadata.name}')
+
+oc exec -n nvidia-gpu-operator $DRIVER_POD -c nvidia-driver-ctr -- nvidia-smi mig -lgi
+# Expected: No MIG instances — DRA driver destroyed partitions after claim deletion
+```
+
+**Validated result:** `nvidia-smi mig -lgi` returned empty after `mig-pod-1g` and `mig-pod-2g` pods completed and their claims were released.
+
+### 4. Static MIG + DRA — Key Finding ✅ Validated (Concept Clarified)
+
+> **Validated on:** OCP 4.22.22 / K8s 1.35, GPU Operator v26.7.2, 2026-11-19
+
+**Finding:** `mig.nvidia.com` ResourceSlices only appear when `DynamicMIG: true` is set in GPUCluster.
+Without DynamicMIG, only whole-GPU `gpu.nvidia.com` devices appear — even if hardware has MIG instances configured.
+
+This was confirmed by applying the default GPUCluster CR (DynamicMIG=false) while the hardware had a full mixed MIG layout (1g.10gb + 2g.20gb + 3g.40gb on each chip). Result: only 8 `gpu.nvidia.com` devices published, no `mig.nvidia.com` ResourceSlices at all.
+
+```bash
+# Test: GPUCluster without DynamicMIG + hardware with MIG instances
+oc get resourceslices
+# ACTUAL result: only gpu.nvidia.com ResourceSlice (8 whole-GPU devices)
+# NO mig.nvidia.com ResourceSlices despite active hardware MIG partitions
+
+oc get resourceslices -o json | jq '.items[] | select(.spec.driver=="mig.nvidia.com")'
+# ACTUAL result: empty — DRAPartitionableDevices alone is not sufficient
+# DynamicMIG: true in GPUCluster is required
+```
+
+**Conclusion:** There is no separate "Static MIG + DRA" mode. `DynamicMIG: true` is required for all MIG+DRA use cases. The DRA driver only publishes `mig.nvidia.com` ResourceSlices (and the partitionable device capability) when DynamicMIG is explicitly enabled.
+
+**MIG + DRA modes (corrected):**
+
+| Mode | DynamicMIG flag | MIG ResourceSlices | Behavior |
+|---|---|---|---|
+| Whole-GPU only | `false` (default) | ❌ | 8 × `gpu.nvidia.com` devices |
+| MIG + DRA | `true` | ✅ 26 per chip | All profile combos + `consumesCounters`; driver creates partitions on-demand |
+
+**Operational implication:** When DynamicMIG is enabled, the driver will allocate from existing hardware MIG partitions if they already match the requested profile. It only creates new partitions when no matching geometry exists. Node labels (via ClusterPolicy + MIG Manager) can pre-configure the hardware geometry, which DynamicMIG will then manage — but DynamicMIG must be on for ResourceSlices to publish.
+
+### 5. OCP Version Roadmap ✅
 
 | OCP | K8s | `DRAPartitionableDevices` | How to Enable |
 |---|---|---|---|
-| 4.21 | 1.34 | Not in TechPreview | `CustomNoUpgrade` only — but locked out if TechPreviewNoUpgrade already set |
-| **4.22** | **1.35** | **In TechPreviewNoUpgrade** | `oc patch featuregate cluster --type=merge -p '{"spec":{"featureSet":"TechPreviewNoUpgrade"}}'` |
+| 4.21 | 1.34 | Not in TechPreview | `CustomNoUpgrade` only — blocked if `TechPreviewNoUpgrade` already set |
+| **4.22** | **1.35** | **In TechPreviewNoUpgrade** ✅ | `oc patch featuregate cluster --type=merge -p '{"spec":{"featureSet":"TechPreviewNoUpgrade"}}'` |
 | 5.0+ | 1.36+ | Default-on | No gate needed |
 
 ---

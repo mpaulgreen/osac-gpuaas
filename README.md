@@ -8,7 +8,7 @@ Knowledgebase for the **GPU-as-a-Service (GPUaaS) prototype** on IBM Cloud VPC. 
 
 | Path | Purpose |
 |---|---|
-| `ibmc/openshift-h200-provisioning.md` | Full UPI provisioning guide — OCP 4.21 on IBM Cloud VPC with H100 GPU worker (Parts A–F) |
+| `ibmc/openshift-h200-provisioning.md` | Full UPI provisioning guide — OCP 4.22 on IBM Cloud VPC with H100 GPU worker (Parts A–F) |
 | `ibmc/ibmcloud-h200-env.example` | Environment template → copy to `~/.ibmcloud-h200-env` |
 | `ibmc/install-certificates.md` | Let's Encrypt TLS via cert-manager + IBM CIS DNS-01 webhook |
 | `mig/poc.md` | MIG partitioning research notes — isolation, telemetry, reconfiguration, RHOAI integration (all validated on H100) |
@@ -23,12 +23,13 @@ Knowledgebase for the **GPU-as-a-Service (GPUaaS) prototype** on IBM Cloud VPC. 
 |---|---|
 | **Account** | Ecosystem AI workloads (IBM Cloud 3179756) |
 | **Region / Zone** | `ca-tor` / `ca-tor-3` |
-| **OCP version** | 4.21.42 |
+| **OCP version** | 4.22.22 |
 | **Control plane** | 3 × `bx2-8x32` masters |
 | **GPU worker** | 1 × `gx3d-160x1792x8h100` — 8 × H100 80GB HBM3 |
-| **GPU Operator** | v25.10.1, ClusterPolicy `ready` |
+| **GPU Operator** | v26.7.2, GPUCluster + NvidiaDriver (DRA mode) |
 | **RHOAI** | 3.5.3, DSC `Ready` |
 | **TLS** | Let's Encrypt via cert-manager + IBM CIS webhook |
+| **FeatureSet** | `TechPreviewNoUpgrade` (DRAPartitionableDevices active) |
 
 ---
 
